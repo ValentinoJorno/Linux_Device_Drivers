@@ -3,7 +3,6 @@
  *
  * Copyright (C) 2001 Alessandro Rubini and Jonathan Corbet
  * Copyright (C) 2001 O'Reilly & Associates
- * Copyright (C) 2011 Vigith Maurice
  *
  * The source code in this file can be freely used, adapted,
  * and redistributed in source or binary form, so long as an
@@ -15,7 +14,6 @@
  *
  */
 
-
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/init.h>
@@ -25,15 +23,16 @@
 #include <linux/fs.h>		/* everything... */
 #include <linux/errno.h>	/* error codes */
 #include <linux/types.h>	/* size_t */
-
+#include <linux/proc_fs.h>
 #include <linux/fcntl.h>	/* O_ACCMODE */
 #include <linux/seq_file.h>
 #include <linux/cdev.h>
 
-#include <asm/system.h>		/* cli(), *_flags */
-#include <asm/uaccess.h>	/* copy_*_user */
+#include <linux/uaccess.h>	/* copy_*_user */
 
 #include "scull.h"		/* local definitions */
+#include "access_ok_version.h"
+#include "proc_ops_version.h"
 
 /*
  * Our parameters which can be set at load time.
@@ -51,7 +50,7 @@ module_param(scull_nr_devs, int, S_IRUGO);
 module_param(scull_quantum, int, S_IRUGO);
 module_param(scull_qset, int, S_IRUGO);
 
-MODULE_AUTHOR("Alessandro Rubini, Jonathan Corbet, Vigith Maurice");
+MODULE_AUTHOR("Alessandro Rubini, Jonathan Corbet");
 MODULE_LICENSE("Dual BSD/GPL");
 
 struct scull_dev *scull_devices;	/* allocated in scull_init_module */
@@ -61,37 +60,177 @@ struct scull_dev *scull_devices;	/* allocated in scull_init_module */
  * Empty out the scull device; must be called with the device
  * semaphore held.
  */
-/* primary purpose of scull_trim function is to completely empty 
-   the device's data buffer and free all allocated memory,
-   resetting the device capacity back to zero.
-   It is typically called when the device is opened in write-only mode (O_WRONLY) 
-   to truncate existing content, or during module cleanup.*/
 int scull_trim(struct scull_dev *dev)
 {
 	struct scull_qset *next, *dptr;
 	int qset = dev->qset;   /* "dev" is not-null */
 	int i;
-	
-	// 1. Loop through all items in the linked list
+
 	for (dptr = dev->data; dptr; dptr = next) { /* all the list items */
 		if (dptr->data) {
-		    // 2. Free each individual quantum (data block) inside this qset
 			for (i = 0; i < qset; i++)
-				// 3. Free the array holding the quantum pointers
 				kfree(dptr->data[i]);
 			kfree(dptr->data);
 			dptr->data = NULL;
 		}
-		next = dptr->next; // Keep reference to the next node before freeing current
-		kfree(dptr);// 4. Free the node structure itself
+		next = dptr->next;
+		kfree(dptr);
 	}
-	// 5. Reset device metadata back to default parameters
 	dev->size = 0;
 	dev->quantum = scull_quantum;
 	dev->qset = scull_qset;
 	dev->data = NULL;
 	return 0;
 }
+#ifdef SCULL_DEBUG /* use proc only if debugging */
+/*
+ * The proc filesystem: function to read and entry
+ */
+
+int scull_read_procmem(struct seq_file *s, void *v)
+{
+        int i, j;
+        int limit = s->size - 80; /* Don't print more than this */
+
+        for (i = 0; i < scull_nr_devs && s->count <= limit; i++) {
+                struct scull_dev *d = &scull_devices[i];
+                struct scull_qset *qs = d->data;
+                if (mutex_lock_interruptible(&d->lock))
+                        return -ERESTARTSYS;
+                seq_printf(s,"\nDevice %i: qset %i, q %i, sz %li\n",
+                             i, d->qset, d->quantum, d->size);
+                for (; qs && s->count <= limit; qs = qs->next) { /* scan the list */
+                        seq_printf(s, "  item at %p, qset at %p\n",
+                                     qs, qs->data);
+                        if (qs->data && !qs->next) /* dump only the last item */
+                                for (j = 0; j < d->qset; j++) {
+                                        if (qs->data[j])
+                                                seq_printf(s, "    % 4i: %8p\n",
+                                                             j, qs->data[j]);
+                                }
+                }
+                mutex_unlock(&scull_devices[i].lock);
+        }
+        return 0;
+}
+
+
+
+/*
+ * Here are our sequence iteration methods.  Our "position" is
+ * simply the device number.
+ */
+static void *scull_seq_start(struct seq_file *s, loff_t *pos)
+{
+	if (*pos >= scull_nr_devs)
+		return NULL;   /* No more to read */
+	return scull_devices + *pos;
+}
+
+static void *scull_seq_next(struct seq_file *s, void *v, loff_t *pos)
+{
+	(*pos)++;
+	if (*pos >= scull_nr_devs)
+		return NULL;
+	return scull_devices + *pos;
+}
+
+static void scull_seq_stop(struct seq_file *s, void *v)
+{
+	/* Actually, there's nothing to do here */
+}
+
+static int scull_seq_show(struct seq_file *s, void *v)
+{
+	struct scull_dev *dev = (struct scull_dev *) v;
+	struct scull_qset *d;
+	int i;
+
+	if (mutex_lock_interruptible(&dev->lock))
+		return -ERESTARTSYS;
+	seq_printf(s, "\nDevice %i: qset %i, q %i, sz %li\n",
+			(int) (dev - scull_devices), dev->qset,
+			dev->quantum, dev->size);
+	for (d = dev->data; d; d = d->next) { /* scan the list */
+		seq_printf(s, "  item at %p, qset at %p\n", d, d->data);
+		if (d->data && !d->next) /* dump only the last item */
+			for (i = 0; i < dev->qset; i++) {
+				if (d->data[i])
+					seq_printf(s, "    % 4i: %8p\n",
+							i, d->data[i]);
+			}
+	}
+	mutex_unlock(&dev->lock);
+	return 0;
+}
+	
+/*
+ * Tie the sequence operators up.
+ */
+static struct seq_operations scull_seq_ops = {
+	.start = scull_seq_start,
+	.next  = scull_seq_next,
+	.stop  = scull_seq_stop,
+	.show  = scull_seq_show
+};
+
+/*
+ * Now to implement the /proc files we need only make an open
+ * method which sets up the sequence operators.
+ */
+static int scullmem_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, scull_read_procmem, NULL);
+}
+
+static int scullseq_proc_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &scull_seq_ops);
+}
+
+/*
+ * Create a set of file operations for our proc files.
+ */
+static struct file_operations scullmem_proc_ops = {
+	.owner   = THIS_MODULE,
+	.open    = scullmem_proc_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release
+};
+
+static struct file_operations scullseq_proc_ops = {
+	.owner   = THIS_MODULE,
+	.open    = scullseq_proc_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = seq_release
+};
+	
+
+/*
+ * Actually create (and remove) the /proc file(s).
+ */
+
+static void scull_create_proc(void)
+{
+	proc_create_data("scullmem", 0 /* default mode */,
+			NULL /* parent dir */, proc_ops_wrapper(&scullmem_proc_ops, scullmem_pops),
+			NULL /* client data */);
+	proc_create("scullseq", 0, NULL, proc_ops_wrapper(&scullseq_proc_ops, scullseq_pops));
+}
+
+static void scull_remove_proc(void)
+{
+	/* no problem if it was not registered */
+	remove_proc_entry("scullmem", NULL /* parent dir */);
+	remove_proc_entry("scullseq", NULL);
+}
+
+
+#endif /* SCULL_DEBUG */
+
+
 
 
 
@@ -99,39 +238,23 @@ int scull_trim(struct scull_dev *dev)
  * Open and close
  */
 
-/* The primary purpose of the scull_open function in the Linux kernel scull character device driver is 
- to prepare the device for subsequent file operations 
- (such as read and write) by connecting the kernel's inode data structure to the driver's device structure
-  and saving a pointer to it in the file structure. */
 int scull_open(struct inode *inode, struct file *filp)
 {
 	struct scull_dev *dev; /* device information */
 
-	/* Retrieve Device Structure: The container_of macro uses the inode->i_cdev pointer 
-	 to find the enclosing struct scull_dev instance. */
 	dev = container_of(inode->i_cdev, struct scull_dev, cdev);
-
-	/* Store Private Data: It assigns the device structure to filp->private_data 
-	 so that future driver methods (scull_read, scull_write, etc.) 
-	 can easily access the correct device instance. */
 	filp->private_data = dev; /* for other methods */
 
-	/* now trim to 0 the length of the device if open was write-only 
-	 Reset Write-Only Devices: Checks if the file flags (filp->f_flags & O_ACCMODE) equal O_WRONLY. 
-	 If true, it calls scull_trim(dev) to clear the device's memory. 
-	 (Note: Production drivers typically wrap scull_trim with mutex/semaphore locking like down_interruptible
-	 to prevent race conditions). */
+	/* now trim to 0 the length of the device if open was write-only */
 	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {
-		if (down_interruptible(&dev->sem))
+		if (mutex_lock_interruptible(&dev->lock))
 			return -ERESTARTSYS;
-		scull_trim(dev);  // ignore errors , it truncates(trims) the device's data length to 0 using scull_trim(dev)
-		up(&dev->sem);
+		scull_trim(dev); /* ignore errors */
+		mutex_unlock(&dev->lock);
 	}
 	return 0;          /* success */
 }
 
-/* scull_release function is to deallocate and clean up any system resources that were assigned
-   to a device file during its opening phase. */
 int scull_release(struct inode *inode, struct file *filp)
 {
 	return 0;
@@ -139,91 +262,48 @@ int scull_release(struct inode *inode, struct file *filp)
 /*
  * Follow the list
  */
-
-/* The primary purpose of the scull_follow function to traverse the device's memory 
-linked list and locate (or dynamically allocate) a specific quantum set (struct scull_qset). */
 struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 {
-	/* The function sets a local pointer qs to the head of the list  
-	scull_qset node stored inside the main device configuration (dev->data). */
 	struct scull_qset *qs = dev->data;
 
-    // qs is NULL (meaning no scull_qset has been allocated for this device yet).  
+        /* Allocate first qset explicitly if need be */
 	if (! qs) {
-		
-		/* Allocates kernel memory for the very first struct scull_qset node 
-		using kmalloc with GFP_KERNEL (which can sleep/wait if memory is low) 
-		and assigns this pointer to both qs and dev->data.*/
 		qs = dev->data = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
-		
-		// Checks if the kmalloc memory allocation failed (returned NULL)
 		if (qs == NULL)
-			/* Exits the function and returns selenium/NULL to signal 
-			an out-of-memory error to the caller. */
-			return NULL;  
-		/* Zero-initializes the newly allocated struct scull_qset memory so all pointers 
-		   and fields start at 0 or NULL. */
+			return NULL;  /* Never mind */
 		memset(qs, 0, sizeof(struct scull_qset));
-	} // Closes the if (!qs) block.
+	}
 
-	/* Loops n times, decrementing n at each iteration
-	   until it reaches 0 (traverses n nodes down the chain). 
-	   This loop runs exactly n times to walk down the linked list to the item index 
-	   requested by the caller (usually determined by the file position pointer f_pos 
-	   in a read or write call). */
+	/* Then follow the list */
 	while (n--) {
-		/* Checks if the next node in the linked list (qs->next) does not exist yet (NULL).
-		   While stepping through the list, if the loop realizes the list is shorter than the 
-	 	   requested index n (i.e., qs->next is NULL), it extends the list on-the-fly. */
 		if (!qs->next) {
-			/* Dynamically allocates a new struct scull_qset node and assigns it to qs->next. 
-		       It dynamically allocates the next node using kmalloc, checks for failure, zeroes 
-			   it, and links it into the list (qs->next = ...). */
 			qs->next = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
-			/* Checks if this subsequent kmalloc failed due to a lack of memory */
 			if (qs->next == NULL)
-				/* Returns NULL if the allocation fails midway through the list traversal. */
 				return NULL;  /* Never mind */
-			/* Clears/zeroes out the newly allocated next node. */
 			memset(qs->next, 0, sizeof(struct scull_qset));
 		}
-		/* Moves the current pointer qs forward to the next node in the list.*/
 		qs = qs->next;
-		/* Explicitly jumps to the next iteration of the while loop 
-		   (redundant here, as it's already at the end of the loop body). */
 		continue;
-	} // Closes the while (n--) loop.
-	/* Returns the pointer to the target scull_qset node located at index n. */
+	}
 	return qs;
-} // Closes the function definition.
+}
 
 /*
  * Data management: read and write
  */
-/* The primary purpose of the  scull_read function is to transfer data from the kernel space 
-memory (where the SCULL device holds its data) to the user space buffer .*/
 
-/* Defines the standard read method for a character device. 
-It takes the open file structure (filp), a user-space destination buffer (buf), 
-the number of bytes requested (count), and the current file position pointer (f_pos). */
 ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-	/* Retrieves the custom scull_dev device structure stored 
-	inside filp->private_data when the file was opened. */
 	struct scull_dev *dev = filp->private_data; 
 	struct scull_qset *dptr;	/* the first listitem */
 	int quantum = dev->quantum, qset = dev->qset;
 	int itemsize = quantum * qset; /* how many bytes in the listitem */
 	int item, s_pos, q_pos, rest;
 	ssize_t retval = 0;
-	
-    /* Locking: It uses down_interruptible(&dev->sem) (or a mutex in newer ports)
-	   to safely share access to the device data structure */
-	if (down_interruptible(&dev->sem))
+
+	if (mutex_lock_interruptible(&dev->lock))
 		return -ERESTARTSYS;
-	/* Position Bounds: It checks *f_pos against dev->size to ensure 
-	   it does not read past the end of the written data. */
 	if (*f_pos >= dev->size)
 		goto out;
 	if (*f_pos + count > dev->size)
@@ -241,13 +321,9 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 		goto out; /* don't fill holes */
 
 	/* read only up to the end of this quantum */
-	/* Address Calculation: It calculates the correct linked-list item (item), 
-	   array index (s_pos), and offset (q_pos) inside the quantum memory pool. */
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
-	
-	/* Copy to User: It safely copies data using copy_to_user and updates the file position
-	   pointer *f_pos by the number of bytes read. */
+
 	if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count)) {
 		retval = -EFAULT;
 		goto out;
@@ -256,54 +332,32 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	retval = count;
 
   out:
-	up(&dev->sem);
+	mutex_unlock(&dev->lock);
 	return retval;
 }
 
-/* primary purpose of the "scull_write" function is to transfer a stream of bytes 
-   from a user-space buffer into the memory-based storage managed by the scull character device driver. */
 ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-	/* Initialization & Concurrency Control:
-	   It extracts the custom device structure (struct scull_dev) 
-	   from the file's private_data field. */
 	struct scull_dev *dev = filp->private_data;
 	struct scull_qset *dptr;
-	
-	/* Position Calculation:
-	   scull allocates memory dynamically in a linked list 
-	   of arrays called "quantum sets" (qset). */
 	int quantum = dev->quantum, qset = dev->qset;
 	int itemsize = quantum * qset;
 	int item, s_pos, q_pos, rest;
 	ssize_t retval = -ENOMEM; /* value used in "goto out" statements */
 
-    /* It acquires a semaphore (down_interruptible(&dev->sem)) 
-	   to protect against concurrent data modifications by multiple processes. 
-	   If interrupted by a signal, it cleanly exits with -ERESTARTSYS. */
-	if (down_interruptible(&dev->sem))
+	if (mutex_lock_interruptible(&dev->lock))
 		return -ERESTARTSYS;
 
 	/* find listitem, qset index and offset in the quantum */
-	/* The code takes the target file position pointer (f_pos) 
-	   and mathematically computes exactly which linked-list item (item), 
-	   which slot in the pointer array (s_pos), and which byte offset 
-	   within the memory quantum (q_pos) it needs to write to. */
 	item = (long)*f_pos / itemsize;
 	rest = (long)*f_pos % itemsize;
 	s_pos = rest / quantum; q_pos = rest % quantum;
 
-	/* follow the list up to the right position 
-	   It traverses the linked list using scull_follow to find the correct quantum set. */
+	/* follow the list up to the right position */
 	dptr = scull_follow(dev, item);
 	if (dptr == NULL)
 		goto out;
-	
-	/* Memory Allocation on Demand:
-	   If the array of quantum pointers (dptr->data)
-       or the individual storage quantum (dptr->data[s_pos]) doesn't exist yet,
-       it allocates them on the fly using kmalloc with the GFP_KERNEL flag. */
 	if (!dptr->data) {
 		dptr->data = kmalloc(qset * sizeof(char *), GFP_KERNEL);
 		if (!dptr->data)
@@ -315,23 +369,14 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
 		if (!dptr->data[s_pos])
 			goto out;
 	}
-	/* Data Transfer & Size Update:
-	- write only up to the end of this quantum.
-	- It restricts the requested write amount (count) 
-	  so that it doesn't write past the boundary of the current quantum.*/
+	/* write only up to the end of this quantum */
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
 
-	/* It safe-copies the data from the user space buffer (buf) 
-	   to the kernel-space memory address using copy_from_user. */
 	if (copy_from_user(dptr->data[s_pos]+q_pos, buf, count)) {
 		retval = -EFAULT;
 		goto out;
 	}
-	
-	/* Finally, it advances the file position pointer (*f_pos), 
-	   updates the tracked device data size if it grew, 
-	   releases the semaphore, and returns the total number of bytes successfully written. *
 	*f_pos += count;
 	retval = count;
 
@@ -340,9 +385,137 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
 		dev->size = *f_pos;
 
   out:
-	up(&dev->sem);
+	mutex_unlock(&dev->lock);
 	return retval;
 }
+
+/*
+ * The ioctl() implementation
+ */
+
+long scull_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+
+	int err = 0, tmp;
+	int retval = 0;
+    
+	/*
+	 * extract the type and number bitfields, and don't decode
+	 * wrong cmds: return ENOTTY (inappropriate ioctl) before access_ok()
+	 */
+	if (_IOC_TYPE(cmd) != SCULL_IOC_MAGIC) return -ENOTTY;
+	if (_IOC_NR(cmd) > SCULL_IOC_MAXNR) return -ENOTTY;
+
+	/*
+	 * the direction is a bitmask, and VERIFY_WRITE catches R/W
+	 * transfers. `Type' is user-oriented, while
+	 * access_ok is kernel-oriented, so the concept of "read" and
+	 * "write" is reversed
+	 */
+	if (_IOC_DIR(cmd) & _IOC_READ)
+		err = !access_ok_wrapper(VERIFY_WRITE, (void __user *)arg, _IOC_SIZE(cmd));
+	else if (_IOC_DIR(cmd) & _IOC_WRITE)
+		err =  !access_ok_wrapper(VERIFY_READ, (void __user *)arg, _IOC_SIZE(cmd));
+	if (err) return -EFAULT;
+
+	switch(cmd) {
+
+	  case SCULL_IOCRESET:
+		scull_quantum = SCULL_QUANTUM;
+		scull_qset = SCULL_QSET;
+		break;
+        
+	  case SCULL_IOCSQUANTUM: /* Set: arg points to the value */
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		retval = __get_user(scull_quantum, (int __user *)arg);
+		break;
+
+	  case SCULL_IOCTQUANTUM: /* Tell: arg is the value */
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		scull_quantum = arg;
+		break;
+
+	  case SCULL_IOCGQUANTUM: /* Get: arg is pointer to result */
+		retval = __put_user(scull_quantum, (int __user *)arg);
+		break;
+
+	  case SCULL_IOCQQUANTUM: /* Query: return it (it's positive) */
+		return scull_quantum;
+
+	  case SCULL_IOCXQUANTUM: /* eXchange: use arg as pointer */
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		tmp = scull_quantum;
+		retval = __get_user(scull_quantum, (int __user *)arg);
+		if (retval == 0)
+			retval = __put_user(tmp, (int __user *)arg);
+		break;
+
+	  case SCULL_IOCHQUANTUM: /* sHift: like Tell + Query */
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		tmp = scull_quantum;
+		scull_quantum = arg;
+		return tmp;
+        
+	  case SCULL_IOCSQSET:
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		retval = __get_user(scull_qset, (int __user *)arg);
+		break;
+
+	  case SCULL_IOCTQSET:
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		scull_qset = arg;
+		break;
+
+	  case SCULL_IOCGQSET:
+		retval = __put_user(scull_qset, (int __user *)arg);
+		break;
+
+	  case SCULL_IOCQQSET:
+		return scull_qset;
+
+	  case SCULL_IOCXQSET:
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		tmp = scull_qset;
+		retval = __get_user(scull_qset, (int __user *)arg);
+		if (retval == 0)
+			retval = put_user(tmp, (int __user *)arg);
+		break;
+
+	  case SCULL_IOCHQSET:
+		if (! capable (CAP_SYS_ADMIN))
+			return -EPERM;
+		tmp = scull_qset;
+		scull_qset = arg;
+		return tmp;
+
+        /*
+         * The following two change the buffer size for scullpipe.
+         * The scullpipe device uses this same ioctl method, just to
+         * write less code. Actually, it's the same driver, isn't it?
+         */
+
+	  case SCULL_P_IOCTSIZE:
+		scull_p_buffer = arg;
+		break;
+
+	  case SCULL_P_IOCQSIZE:
+		return scull_p_buffer;
+
+
+	  default:  /* redundant, as cmd was checked against MAXNR */
+		return -ENOTTY;
+	}
+	return retval;
+
+}
+
 
 
 /*
@@ -382,6 +555,7 @@ struct file_operations scull_fops = {
 	.llseek =   scull_llseek,
 	.read =     scull_read,
 	.write =    scull_write,
+	.unlocked_ioctl = scull_ioctl,
 	.open =     scull_open,
 	.release =  scull_release,
 };
@@ -409,8 +583,16 @@ void scull_cleanup_module(void)
 		kfree(scull_devices);
 	}
 
+#ifdef SCULL_DEBUG /* use proc only if debugging */
+	scull_remove_proc();
+#endif
+
 	/* cleanup_module is never called if registering failed */
 	unregister_chrdev_region(devno, scull_nr_devs);
+
+	/* and call the cleanup functions for friend devices */
+	scull_p_cleanup();
+	scull_access_cleanup();
 
 }
 
@@ -424,7 +606,6 @@ static void scull_setup_cdev(struct scull_dev *dev, int index)
     
 	cdev_init(&dev->cdev, &scull_fops);
 	dev->cdev.owner = THIS_MODULE;
-	dev->cdev.ops = &scull_fops; /* not sure what is this doing here!!, this is OLD STYLE */
 	err = cdev_add (&dev->cdev, devno, 1);
 	/* Fail gracefully if need be */
 	if (err)
@@ -437,10 +618,10 @@ int scull_init_module(void)
 	int result, i;
 	dev_t dev = 0;
 
-/*
- * Get a range of minor numbers to work with, asking for a dynamic
- * major unless directed otherwise at load time.
- */
+	/*
+	 * Get a range of minor numbers to work with, asking for a dynamic
+	 * major unless directed otherwise at load time.
+	 */
 	if (scull_major) {
 		dev = MKDEV(scull_major, scull_minor);
 		result = register_chrdev_region(dev, scull_nr_devs, "scull");
@@ -454,7 +635,7 @@ int scull_init_module(void)
 		return result;
 	}
 
-        /* 
+	/* 
 	 * allocate the devices -- we can't have them static, as the number
 	 * can be specified at load time
 	 */
@@ -469,9 +650,18 @@ int scull_init_module(void)
 	for (i = 0; i < scull_nr_devs; i++) {
 		scull_devices[i].quantum = scull_quantum;
 		scull_devices[i].qset = scull_qset;
-		init_MUTEX(&scull_devices[i].sem);
+		mutex_init(&scull_devices[i].lock);
 		scull_setup_cdev(&scull_devices[i], i);
 	}
+
+        /* At this point call the init function for any friend device */
+	dev = MKDEV(scull_major, scull_minor + scull_nr_devs);
+	dev += scull_p_init(dev);
+	dev += scull_access_init(dev);
+
+#ifdef SCULL_DEBUG /* only when debugging */
+	scull_create_proc();
+#endif
 
 	return 0; /* succeed */
 
@@ -482,4 +672,3 @@ int scull_init_module(void)
 
 module_init(scull_init_module);
 module_exit(scull_cleanup_module);
-
