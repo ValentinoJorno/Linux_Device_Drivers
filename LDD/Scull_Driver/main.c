@@ -200,11 +200,17 @@ struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 /*
  * Data management: read and write
  */
-/* scull_read function is to transfer data from the kernel space 
+/* The primary purpose of the  scull_read function is to transfer data from the kernel space 
 memory (where the SCULL device holds its data) to the user space buffer .*/
+
+/* Defines the standard read method for a character device. 
+It takes the open file structure (filp), a user-space destination buffer (buf), 
+the number of bytes requested (count), and the current file position pointer (f_pos). */
 ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+	/* Retrieves the custom scull_dev device structure stored 
+	inside filp->private_data when the file was opened. */
 	struct scull_dev *dev = filp->private_data; 
 	struct scull_qset *dptr;	/* the first listitem */
 	int quantum = dev->quantum, qset = dev->qset;
