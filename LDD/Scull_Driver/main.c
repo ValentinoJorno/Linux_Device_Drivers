@@ -71,17 +71,21 @@ int scull_trim(struct scull_dev *dev)
 	struct scull_qset *next, *dptr;
 	int qset = dev->qset;   /* "dev" is not-null */
 	int i;
-
+	
+	// 1. Loop through all items in the linked list
 	for (dptr = dev->data; dptr; dptr = next) { /* all the list items */
 		if (dptr->data) {
+		    // 2. Free each individual quantum (data block) inside this qset
 			for (i = 0; i < qset; i++)
+				// 3. Free the array holding the quantum pointers
 				kfree(dptr->data[i]);
 			kfree(dptr->data);
 			dptr->data = NULL;
 		}
-		next = dptr->next;
-		kfree(dptr);
+		next = dptr->next; // Keep reference to the next node before freeing current
+		kfree(dptr);// 4. Free the node structure itself
 	}
+	// 5. Reset device metadata back to default parameters
 	dev->size = 0;
 	dev->quantum = scull_quantum;
 	dev->qset = scull_qset;
@@ -148,7 +152,8 @@ struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 /*
  * Data management: read and write
  */
-
+/* scull_read function is to transfer data from the kernel space 
+memory (where the SCULL device holds its data) to the user space buffer .*/
 ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
@@ -158,9 +163,13 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	int itemsize = quantum * qset; /* how many bytes in the listitem */
 	int item, s_pos, q_pos, rest;
 	ssize_t retval = 0;
-
+	
+    /* Locking: It uses down_interruptible(&dev->sem) (or a mutex in newer ports)
+	   to safely share access to the device data structure */
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
+	/* Position Bounds: It checks *f_pos against dev->size to ensure 
+	   it does not read past the end of the written data. */
 	if (*f_pos >= dev->size)
 		goto out;
 	if (*f_pos + count > dev->size)
@@ -178,9 +187,13 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 		goto out; /* don't fill holes */
 
 	/* read only up to the end of this quantum */
+	/* Address Calculation: It calculates the correct linked-list item (item), 
+	   array index (s_pos), and offset (q_pos) inside the quantum memory pool. */
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
-
+	
+	/* Copy to User: It safely copies data using copy_to_user and updates the file position
+	   pointer *f_pos by the number of bytes read. */
 	if (copy_to_user(buf, dptr->data[s_pos] + q_pos, count)) {
 		retval = -EFAULT;
 		goto out;
