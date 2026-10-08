@@ -144,29 +144,58 @@ int scull_release(struct inode *inode, struct file *filp)
 linked list and locate (or dynamically allocate) a specific quantum set (struct scull_qset). */
 struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 {
+	/* The function sets a local pointer qs to the head of the list  
+	scull_qset node stored inside the main device configuration (dev->data). */
 	struct scull_qset *qs = dev->data;
 
-        /* Allocate first qset explicitly if need be */
+    // qs is NULL (meaning no scull_qset has been allocated for this device yet).  
 	if (! qs) {
+		
+		/* Allocates kernel memory for the very first struct scull_qset node 
+		using kmalloc with GFP_KERNEL (which can sleep/wait if memory is low) 
+		and assigns this pointer to both qs and dev->data.*/
 		qs = dev->data = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
+		
+		// Checks if the kmalloc memory allocation failed (returned NULL)
 		if (qs == NULL)
-			return NULL;  /* Never mind */
+			/* Exits the function and returns selenium/NULL to signal 
+			an out-of-memory error to the caller. */
+			return NULL;  
+		/* Zero-initializes the newly allocated struct scull_qset memory so all pointers 
+		   and fields start at 0 or NULL. */
 		memset(qs, 0, sizeof(struct scull_qset));
-	}
+	} // Closes the if (!qs) block.
 
-	/* Then follow the list */
+	/* Loops n times, decrementing n at each iteration
+	   until it reaches 0 (traverses n nodes down the chain). 
+	   This loop runs exactly n times to walk down the linked list to the item index 
+	   requested by the caller (usually determined by the file position pointer f_pos 
+	   in a read or write call). */
 	while (n--) {
+		/* Checks if the next node in the linked list (qs->next) does not exist yet (NULL).
+		   While stepping through the list, if the loop realizes the list is shorter than the 
+	 	   requested index n (i.e., qs->next is NULL), it extends the list on-the-fly. */
 		if (!qs->next) {
+			/* Dynamically allocates a new struct scull_qset node and assigns it to qs->next. 
+		       It dynamically allocates the next node using kmalloc, checks for failure, zeroes 
+			   it, and links it into the list (qs->next = ...). */
 			qs->next = kmalloc(sizeof(struct scull_qset), GFP_KERNEL);
+			/* Checks if this subsequent kmalloc failed due to a lack of memory */
 			if (qs->next == NULL)
+				/* Returns NULL if the allocation fails midway through the list traversal. */
 				return NULL;  /* Never mind */
+			/* Clears/zeroes out the newly allocated next node. */
 			memset(qs->next, 0, sizeof(struct scull_qset));
 		}
+		/* Moves the current pointer qs forward to the next node in the list.*/
 		qs = qs->next;
+		/* Explicitly jumps to the next iteration of the while loop 
+		   (redundant here, as it's already at the end of the loop body). */
 		continue;
-	}
+	} // Closes the while (n--) loop.
+	/* Returns the pointer to the target scull_qset node located at index n. */
 	return qs;
-}
+} // Closes the function definition.
 
 /*
  * Data management: read and write
