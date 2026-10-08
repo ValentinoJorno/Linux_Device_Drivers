@@ -206,28 +206,50 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	return retval;
 }
 
+/* primary purpose of "scull_write" function is to transfer a stream of bytes 
+   from a user-space buffer into the memory-based storage managed by the scull character device driver. */
 ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+	/* Initialization & Concurrency Control:
+	   It extracts the custom device structure (struct scull_dev) 
+	   from the file's private_data field. */
 	struct scull_dev *dev = filp->private_data;
 	struct scull_qset *dptr;
+	
+	/* Position Calculation:
+	   scull allocates memory dynamically in a linked list 
+	   of arrays called "quantum sets" (qset). */
 	int quantum = dev->quantum, qset = dev->qset;
 	int itemsize = quantum * qset;
 	int item, s_pos, q_pos, rest;
 	ssize_t retval = -ENOMEM; /* value used in "goto out" statements */
 
+    /* It acquires a semaphore (down_interruptible(&dev->sem)) 
+	   to protect against concurrent data modifications by multiple processes. 
+	   If interrupted by a signal, it cleanly exits with -ERESTARTSYS. */
 	if (down_interruptible(&dev->sem))
 		return -ERESTARTSYS;
 
 	/* find listitem, qset index and offset in the quantum */
+	/* The code takes the target file position pointer (f_pos) 
+	   and mathematically computes exactly which linked-list item (item), 
+	   which slot in the pointer array (s_pos), and which byte offset 
+	   within the memory quantum (q_pos) it needs to write to. */
 	item = (long)*f_pos / itemsize;
 	rest = (long)*f_pos % itemsize;
 	s_pos = rest / quantum; q_pos = rest % quantum;
 
-	/* follow the list up to the right position */
+	/* follow the list up to the right position 
+	   It traverses the linked list using scull_follow to find the correct quantum set. */
 	dptr = scull_follow(dev, item);
 	if (dptr == NULL)
 		goto out;
+	
+	/* Memory Allocation on Demand:
+	   If the array of quantum pointers (dptr->data)
+       or the individual storage quantum (dptr->data[s_pos]) doesn't exist yet,
+       it allocates them on the fly using kmalloc with the GFP_KERNEL flag. */
 	if (!dptr->data) {
 		dptr->data = kmalloc(qset * sizeof(char *), GFP_KERNEL);
 		if (!dptr->data)
@@ -239,14 +261,23 @@ ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
 		if (!dptr->data[s_pos])
 			goto out;
 	}
-	/* write only up to the end of this quantum */
+	/* Data Transfer & Size Update:
+	- write only up to the end of this quantum.
+	- It restricts the requested write amount (count) 
+	  so that it doesn't write past the boundary of the current quantum.*/
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
 
+	/* It safe-copies the data from the user space buffer (buf) 
+	   to the kernel-space memory address using copy_from_user. */
 	if (copy_from_user(dptr->data[s_pos]+q_pos, buf, count)) {
 		retval = -EFAULT;
 		goto out;
 	}
+	
+	/* Finally, it advances the file position pointer (*f_pos), 
+	   updates the tracked device data size if it grew, 
+	   releases the semaphore, and returns the total number of bytes successfully written. *
 	*f_pos += count;
 	retval = count;
 
