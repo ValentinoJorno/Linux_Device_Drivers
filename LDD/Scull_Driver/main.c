@@ -99,23 +99,39 @@ int scull_trim(struct scull_dev *dev)
  * Open and close
  */
 
+/* The primary purpose of the scull_open function in the Linux kernel scull character device driver is 
+ to prepare the device for subsequent file operations 
+ (such as read and write) by connecting the kernel's inode data structure to the driver's device structure
+  and saving a pointer to it in the file structure. */
 int scull_open(struct inode *inode, struct file *filp)
 {
 	struct scull_dev *dev; /* device information */
 
+	/* Retrieve Device Structure: The container_of macro uses the inode->i_cdev pointer 
+	 to find the enclosing struct scull_dev instance. */
 	dev = container_of(inode->i_cdev, struct scull_dev, cdev);
+
+	/* Store Private Data: It assigns the device structure to filp->private_data 
+	 so that future driver methods (scull_read, scull_write, etc.) 
+	 can easily access the correct device instance. */
 	filp->private_data = dev; /* for other methods */
 
-	/* now trim to 0 the length of the device if open was write-only */
+	/* now trim to 0 the length of the device if open was write-only 
+	 Reset Write-Only Devices: Checks if the file flags (filp->f_flags & O_ACCMODE) equal O_WRONLY. 
+	 If true, it calls scull_trim(dev) to clear the device's memory. 
+	 (Note: Production drivers typically wrap scull_trim with mutex/semaphore locking like down_interruptible
+	 to prevent race conditions). */
 	if ( (filp->f_flags & O_ACCMODE) == O_WRONLY) {
 		if (down_interruptible(&dev->sem))
 			return -ERESTARTSYS;
-		scull_trim(dev); /* ignore errors */
+		scull_trim(dev);  // ignore errors , it truncates(trims) the device's data length to 0 using scull_trim(dev)
 		up(&dev->sem);
 	}
 	return 0;          /* success */
 }
 
+/* scull_release function is to deallocate and clean up any system resources that were assigned
+   to a device file during its opening phase. */
 int scull_release(struct inode *inode, struct file *filp)
 {
 	return 0;
@@ -123,6 +139,9 @@ int scull_release(struct inode *inode, struct file *filp)
 /*
  * Follow the list
  */
+
+/* The primary purpose of the scull_follow function to traverse the device's memory 
+linked list and locate (or dynamically allocate) a specific quantum set (struct scull_qset). */
 struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 {
 	struct scull_qset *qs = dev->data;
@@ -206,7 +225,7 @@ ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	return retval;
 }
 
-/* primary purpose of "scull_write" function is to transfer a stream of bytes 
+/* primary purpose of the "scull_write" function is to transfer a stream of bytes 
    from a user-space buffer into the memory-based storage managed by the scull character device driver. */
 ssize_t scull_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
