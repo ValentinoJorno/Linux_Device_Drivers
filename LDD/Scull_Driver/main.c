@@ -61,6 +61,11 @@ struct scull_dev *scull_devices;	/* allocated in scull_init_module */
  * Empty out the scull device; must be called with the device
  * semaphore held.
  */
+/* primary purpose of scull_trim function is to completely empty 
+   the device's data buffer and free all allocated memory,
+   resetting the device capacity back to zero.
+   It is typically called when the device is opened in write-only mode (O_WRONLY) 
+   to truncate existing content, or during module cleanup.*/
 int scull_trim(struct scull_dev *dev)
 {
 	struct scull_qset *next, *dptr;
