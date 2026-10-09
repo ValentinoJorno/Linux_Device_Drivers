@@ -32,7 +32,7 @@ To build and run this kernel module, you will need:
 Clone the repository and build the kernel module using the provided `Makefile`:
 
 ```bash
-git clone https://github.com](https://github.com/ValentinoJorno/Linux_Device_Drivers.git
+git clone https://github.com/ValentinoJorno/Linux_Device_Drivers.git
 cd YOUR_REPO_NAME
 make
 ```
