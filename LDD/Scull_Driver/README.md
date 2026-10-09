@@ -1,3 +1,10 @@
+# Scull Driver Project
+
+This folder contains the source code for the Linux scull driver.
+
+* For the main driver documentation, see [README.md](README.md).
+* For details on the initialization script, see the [Scull Init Documentation](readme2.md).
+
 # SCULL Character Device Driver
 
 A Linux kernel character device driver based on the
