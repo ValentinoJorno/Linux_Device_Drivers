@@ -3,7 +3,7 @@
 This folder contains the source code for the Linux scull driver.
 
 * For the main driver documentation, see [README.md](README.md).
-* For details on the initialization script, see the [Scull Init Documentation](readme2.md).
+* For details on the initialization script, see the [Scull Init Documentation](INIT_GUIDE.md).
 
 # SCULL Character Device Driver
 
